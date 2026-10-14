@@ -23,8 +23,8 @@ use crate::acp::acp_client::tool_context::{
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
-    map_update_to_events, qualify_compaction_id, AgentMessageDedup, CompactionFold,
-    CompactionTracker,
+    map_update_to_events, qualify_compaction_id, restored_wake_tool_event, AgentMessageDedup,
+    CompactionFold, CompactionTracker,
 };
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 
@@ -207,7 +207,10 @@ impl Shared {
                 CompactionFold::Patch(event) => return self.emit(*event).await,
             }
         }
-        restore_wake_tool_title(&self.tool_context_cache, &mut notification.update);
+        let restored_wake_event =
+            restore_wake_tool_title(&self.tool_context_cache, &notification.update).and_then(
+                |title| restored_wake_tool_event(self.profile, &notification.update, &title),
+            );
         // One epoch per notification, so its signals belong to the prompt
         // that was current when it arrived.
         let epoch = self.prompt_epoch.load(Ordering::Relaxed);
@@ -234,7 +237,8 @@ impl Shared {
         }
         self.capture_rate_limit(&notification.update);
         let update_for_tool_context = notification.update.clone();
-        let events = map_update_to_events(notification.update, self.profile);
+        let mut events = map_update_to_events(notification.update, self.profile);
+        events.extend(restored_wake_event);
         // Signals go first: if the event send backpressures, the watchdog must
         // not evaluate without a suppression-bearing signal.
         forward_lifecycle_signals(

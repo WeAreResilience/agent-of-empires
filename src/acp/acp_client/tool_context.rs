@@ -128,28 +128,36 @@ pub(super) fn update_tool_context_cache(
 
 /// claude-agent-acp can send a `Monitor` call's args in `ToolCallUpdate`s
 /// whose title is unset, so the name the wake-tool synthesis keys on is
-/// restored from the initial `ToolCall`.
-pub(super) fn restore_wake_tool_title(cache: &ToolContextCache, update: &mut SessionUpdate) {
+/// remembered from the initial `ToolCall`. Returns it for an untitled update.
+pub(super) fn restore_wake_tool_title(
+    cache: &ToolContextCache,
+    update: &SessionUpdate,
+) -> Option<String> {
     let mut cache = cache.lock().expect("tool context cache mutex poisoned");
     match update {
         SessionUpdate::ToolCall(tc) if is_wake_tool_title(&tc.title) => {
             cache
                 .wake_titles
                 .insert(tc.tool_call_id.0.to_string(), tc.title.clone());
+            None
         }
         SessionUpdate::ToolCallUpdate(u) => {
             let id = u.tool_call_id.0.to_string();
-            if u.fields.title.is_none() {
-                u.fields.title = cache.wake_titles.get(&id).cloned();
-            }
+            let restored = u
+                .fields
+                .title
+                .is_none()
+                .then(|| cache.wake_titles.get(&id).cloned())
+                .flatten();
             if matches!(
                 u.fields.status,
                 Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
             ) {
                 cache.wake_titles.remove(&id);
             }
+            restored
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -187,23 +195,20 @@ mod tests {
                 ToolCallUpdateFields::new().status(status),
             ))
         };
-        let title_of = |u: &SessionUpdate| match u {
-            SessionUpdate::ToolCallUpdate(u) => u.fields.title.clone(),
-            _ => None,
-        };
         restore_wake_tool_title(
             &cache,
-            &mut SessionUpdate::ToolCall(ToolCall::new("tc-1", "Monitor")),
+            &SessionUpdate::ToolCall(ToolCall::new("tc-1", "Monitor")),
         );
-        let mut update = untitled(ToolCallStatus::InProgress);
-        restore_wake_tool_title(&cache, &mut update);
-        assert_eq!(title_of(&update).as_deref(), Some("Monitor"));
-        let mut done = untitled(ToolCallStatus::Completed);
-        restore_wake_tool_title(&cache, &mut done);
-        assert_eq!(title_of(&done).as_deref(), Some("Monitor"));
-        let mut after = untitled(ToolCallStatus::InProgress);
-        restore_wake_tool_title(&cache, &mut after);
-        assert_eq!(title_of(&after), None);
+        let restore = |status| restore_wake_tool_title(&cache, &untitled(status));
+        assert_eq!(
+            restore(ToolCallStatus::InProgress).as_deref(),
+            Some("Monitor")
+        );
+        assert_eq!(
+            restore(ToolCallStatus::Completed).as_deref(),
+            Some("Monitor")
+        );
+        assert_eq!(restore(ToolCallStatus::InProgress), None);
     }
 
     #[test]
