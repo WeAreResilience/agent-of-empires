@@ -10,14 +10,14 @@ The "software development factory" scope (a user base with local, remote and SSO
 - **CityHall owns** the user base, SSO and any OIDC integration, per-user authorization, human audit, and moving agents between users (agent-of-empires/cityhall#99).
 - **A typed Principal is the only seam added now.** The "authentication principal" from #2734 section D becomes one type with three variants: the local owner (a Unix socket peer), a Device, and a Proxy (an authenticated reverse proxy such as CityHall's). Every authorization decision goes through one function of principal and route. The scattered `read_only` checks move behind it as their code is touched, not as a separate project.
 - **No owner on Sessions, no human audit log, no user header.** Sessions carry no owner field. `--auth=trusted-proxy` with a user header (#2735 tier 3) is out of scope: a single-user Daemon has no use for the user name.
-- **CityHall reaches its Daemons with a per-workspace bearer.** CityHall mints the token and its proxy injects it; the Daemon runs in token mode and sees a Proxy principal. The `--auth none` exception goes away, and the remote TLS rule of #3839 holds unchanged: the proxy to Daemon hop is HTTPS, loopback, or inside the workspace container (agent-of-empires/cityhall#100).
+- **CityHall reaches its Daemons with a per-workspace bearer.** CityHall mints the token and its proxy injects it; the Daemon runs in token mode and sees a Proxy principal. CityHall stops running its Daemons with `--auth none`; this ADR does not remove the `aoe serve --auth none` option, and whether it survives on non-loopback binds is #3839's call. The remote TLS rule of #3839 holds unchanged: the proxy to Daemon hop is HTTPS, loopback, or inside the workspace container (agent-of-empires/cityhall#100).
 - **Same OS user is one trust boundary.** Daemons sharing an OS user, as CityHall's process backend runs them with distinct `HOME`s, are isolated for data, not for security. The Unix socket path derives from the app directory, not `XDG_RUNTIME_DIR`, so such Daemons do not collide (constraint passed to #4407).
 - **CityHall adapts to the split.** Its current deployment shape is not a constraint on the Daemon and Client work.
 
 ## Considered options
 
 - **One shared Daemon serving many humans.** Rejected: it duplicates CityHall's identity, roles and audit inside the Daemon, and agents run as the Daemon's OS user, so humans sharing a Daemon share its OS privileges. Per-user authorization would reach every route, the Session store, tmux and the Sandbox.
-- **Keep `--auth none` behind a trusted network.** Rejected: it adds a standing exception to the #3839 transport rules for one deployment.
+- **Keep CityHall on `--auth none` behind a trusted network.** Rejected: it adds a standing exception to the #3839 transport rules for one deployment.
 - **CityHall talks to each Daemon over its Unix socket.** Rejected: the proxy would be authorized as the local owner, which it is not.
 
 ## Consequences
