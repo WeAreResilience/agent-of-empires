@@ -18,7 +18,8 @@ use super::config_options::map_acp_config_option;
 use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{extract_plan_from_switch_mode, map_plan_status, plan_status_to_str};
 use super::raw_input::{
-    background_agent_launched_from_value, monitor_event_from_raw, wakeup_event_from_raw,
+    background_agent_launched_from_value, background_command_launched_from_value,
+    monitor_event_from_raw, wakeup_event_from_raw,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -462,7 +463,12 @@ pub(super) fn map_update_to_events(
                 let payload = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
                 match background_agent_launched_from_value(&payload) {
                     Some(event) => events.push(event),
-                    None => events.push(Event::RawAgentUpdate { payload }),
+                    None => {
+                        if profile.supports_wakeup_tools {
+                            events.extend(background_command_launched_from_value(&payload));
+                        }
+                        events.push(Event::RawAgentUpdate { payload });
+                    }
                 }
             }
             if let Some(raw) = update.fields.raw_input.as_ref() {
