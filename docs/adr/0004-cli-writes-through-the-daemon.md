@@ -1,4 +1,4 @@
-# CLI writes go through the Daemon, which the CLI auto-starts
+# Route CLI writes through the Daemon and auto-start it
 
 Status: proposed. Decides #4400 (part of #2734). Terms follow `CONTEXT.md`: **Daemon** is the `aoe serve` process, a **Client** is the TUI, CLI or Web dashboard that pilots it.
 
