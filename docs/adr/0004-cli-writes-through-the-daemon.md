@@ -17,7 +17,7 @@ Today almost every mutating CLI command writes `sessions.json`, tmux, worktrees 
   - Files on the Daemon host: `init`, `hooks approve`. They only make sense when the Client runs on that host.
   - Daemon and install management: `killall`, `update`, `uninstall`, `migrate`, `sandbox reclaim`, `serve`. `migrate` refuses while a Daemon runs.
   - `log-level` only changes a running Daemon, so it errors instead of starting one.
-- **Migration is per command, `add` first,** with no interim notify for commands not yet migrated. #4035's window is bounded and self-healing, and disappears once no Client writes out of band.
+- **Migration is per command, `add` first,** with no interim notify for commands not yet migrated. Until `add` is migrated, a request that resolves a just-added session can still 404 inside #4035's window; the Daemon's next reload restores the row but does not retry that request. The window closes once no Client writes out of band.
 - **The `aoe serve` flags stay the control surface** (`--daemon`, `--stop`, `--status`, `--restart`). Stopping the Daemon stops AoE.
 
 ## Considered options
