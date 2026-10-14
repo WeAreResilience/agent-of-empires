@@ -207,15 +207,20 @@ impl Shared {
                 CompactionFold::Patch(event) => return self.emit(*event).await,
             }
         }
-        let restored_wake_event =
-            restore_wake_tool_title(&self.tool_context_cache, &notification.update).and_then(
-                |title| restored_wake_tool_event(self.profile, &notification.update, &title),
-            );
+        let restored_title =
+            restore_wake_tool_title(&self.tool_context_cache, &notification.update);
+        let restored_wake_event = restored_title
+            .as_deref()
+            .and_then(|title| restored_wake_tool_event(self.profile, &notification.update, title));
         // One epoch per notification, so its signals belong to the prompt
         // that was current when it arrived.
         let epoch = self.prompt_epoch.load(Ordering::Relaxed);
-        let (lifecycle, wakeup) =
-            classify_watchdog_notification_signals(&notification.update, self.profile, suppressing);
+        let (lifecycle, wakeup) = classify_watchdog_notification_signals(
+            &notification.update,
+            restored_title.as_deref(),
+            self.profile,
+            suppressing,
+        );
         if lifecycle.is_some() || wakeup.is_some() {
             self.first_event_after_attach.store(true, Ordering::Relaxed);
         }
