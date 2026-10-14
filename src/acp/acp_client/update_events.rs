@@ -1513,4 +1513,35 @@ mod tests {
             .iter()
             .all(|e| matches!(e, Event::ToolCallUpdated { title: None, .. })));
     }
+
+    #[test]
+    fn background_bash_launch_arms_monitor_badge_for_wake_profiles_only() {
+        let launch = || {
+            let mut update = ToolCallUpdate::new("tc-1", ToolCallUpdateFields::new());
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "claudeCode".to_string(),
+                serde_json::json!({
+                    "toolName": "Bash",
+                    "toolResponse": {"stdout": "", "backgroundTaskId": "byiee4aex"},
+                }),
+            );
+            update.meta = Some(meta);
+            SessionUpdate::ToolCallUpdate(update)
+        };
+        let armed = |events: &[Event]| {
+            events
+                .iter()
+                .any(|e| matches!(e, Event::MonitorArmed { description: None }))
+        };
+        let claude_events = claude(launch());
+        assert!(armed(&claude_events));
+        assert!(matches!(
+            claude_events.last(),
+            Some(Event::RawAgentUpdate { .. })
+        ));
+        let codex = map_update_to_events(launch(), &agent_profiles::CODEX);
+        assert!(!armed(&codex));
+        assert_eq!(kinds(&codex), ["raw_agent_update"]);
+    }
 }
