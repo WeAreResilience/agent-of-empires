@@ -255,6 +255,10 @@ pub(super) fn is_heartbeat_tool_call_id(id: &str) -> bool {
         .is_some_and(|(_, suffix)| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
 }
 
+pub(super) fn is_wake_tool_title(title: &str) -> bool {
+    matches!(title, "ScheduleWakeup" | "Monitor")
+}
+
 /// A wake or monitor tool's own event, `None` for any other tool or a profile
 /// that does not synthesize them. Args reach `ToolCall` on some adapters and
 /// only a later `ToolCallUpdate` on others (#1091), so both arms call this.

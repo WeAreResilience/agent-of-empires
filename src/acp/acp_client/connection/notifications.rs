@@ -19,7 +19,7 @@ use crate::acp::acp_client::rate_limit::rate_limit_rejection_from_meta;
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
-    update_tool_context_cache, ToolCallContextCache, ToolContextCache,
+    restore_wake_tool_title, update_tool_context_cache, ToolCallContextCache, ToolContextCache,
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
@@ -207,6 +207,7 @@ impl Shared {
                 CompactionFold::Patch(event) => return self.emit(*event).await,
             }
         }
+        restore_wake_tool_title(&self.tool_context_cache, &mut notification.update);
         // One epoch per notification, so its signals belong to the prompt
         // that was current when it arrived.
         let epoch = self.prompt_epoch.load(Ordering::Relaxed);
