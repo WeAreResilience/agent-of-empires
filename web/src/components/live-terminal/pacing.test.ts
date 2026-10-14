@@ -208,6 +208,41 @@ describe("scroll anchor across a relayout", () => {
     expect(anchoredScrollTop(anchor!, after.spacer, after.layout, LINE_H)).toBeCloseTo(expected);
   });
 
+  // Stripping whitespace makes differently spaced text look alike, so a copy only counts when it is spaced the same
+  // wherever a row break could not have swallowed the whitespace (#4462).
+  describe("re-wrapped text that differs only in whitespace", () => {
+    const anchorOn = (context: string[]) => ({ line: 1, fromEnd: 6, wrap: 0, fraction: 0, probe: 0, context });
+    const at = (keys: string[]) =>
+      anchoredScrollTop(anchorOn(["abc defghijklmnop"]), 0, layout(ones(keys.length), keys), LINE_H);
+
+    it("skips a nearer copy that has no space where the context has one", () => {
+      expect(at(["abcdefghijklmnop", "x", "y", "z", "abc defg", "hijklmnop", "screen"])).toBe(40);
+    });
+
+    it("skips a nearer copy that has a space where the context has none", () => {
+      const anchor = anchorOn(["abcdefghijklmnop"]);
+      const keys = ["abc defghijklmnop", "x", "y", "z", "abcdefg", "hijklmnop", "screen"];
+      expect(anchoredScrollTop(anchor, 0, layout(ones(keys.length), keys), LINE_H)).toBe(40);
+    });
+
+    it("matches a copy whose space a row break swallowed", () => {
+      // "abc " wrapped at 4 is trimmed to "abc", so the space is gone from the keys.
+      expect(at(["x", "abc", "defghijk", "lmnop", "y", "z", "screen"])).toBe(10);
+    });
+
+    it("matches a copy whose space now opens a row", () => {
+      expect(at(["x", "abc", " defghijklmnop", "y", "z", "w", "screen"])).toBe(10);
+    });
+
+    it("matches a copy with a wider run of whitespace in the same place", () => {
+      expect(at(["x", "abc   defghijklmnop", "y", "z", "w", "v", "screen"])).toBe(10);
+    });
+
+    it("keeps the line number when every copy is spaced differently", () => {
+      expect(at(["abcdefghijklmnop", "x", "y", "z", "abcdefghijklm nop", "q", "screen"])).toBe(10);
+    });
+  });
+
   it("gives up on a position no layout can place", () => {
     expect(scrollAnchor(100, VIEW_H, 2, layout([1, 1]), LINE_H)).toBeNull();
     const pastTheEnd = { line: 9, fromEnd: -5, wrap: 0, fraction: 0, probe: 0, context: [] };

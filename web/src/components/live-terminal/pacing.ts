@@ -193,21 +193,49 @@ function anchorLine(anchor: ScrollAnchor, spacerLines: number, keys: readonly st
   return row == null ? fromStart : row - probe;
 }
 
+/** Whether whitespace precedes a character on its row; unknown at a row's first character, where a re-wrap may
+ *  have put a break in place of the whitespace. */
+type Gap = 0 | 1 | 2;
+const GAP_UNKNOWN: Gap = 0;
+const GAP_SPACE: Gap = 1;
+const GAP_NONE: Gap = 2;
+
+/** The gap before each non-whitespace character of `key`, in order. */
+function gaps(key: string): Gap[] {
+  const out: Gap[] = [];
+  let spaced = false;
+  for (let i = 0; i < key.length; i++) {
+    if (/\s/.test(key[i]!)) spaced = true;
+    else {
+      out.push(out.length === 0 ? GAP_UNKNOWN : spaced ? GAP_SPACE : GAP_NONE);
+      spaced = false;
+    }
+  }
+  return out;
+}
+
 /** The row holding the first character of `context` once a width change has re-wrapped the rows: a re-wrap moves
- *  soft row breaks but keeps every character, so the joined text without whitespace still matches. Of several
- *  copies, the one nearest a prediction wins. */
+ *  soft row breaks but keeps every character, so the joined text without whitespace still matches. Whitespace a
+ *  break can swallow (rows are trimmed at the end) is ignored, but a copy whose characters are spaced differently
+ *  inside a row is other text and does not count. Of several copies, the one nearest a prediction wins. */
 function rewrappedRow(context: readonly string[], keys: readonly string[], predictions: number[]): number | null {
   const strip = (key: string) => key.replace(/\s+/g, "");
   const needle = context.map(strip).join("");
   if (needle.length < MIN_REWRAP_CHARS) return null;
   // Leading blank lines strip to nothing, so the needle starts that many rows below the context's first line.
   const blankLead = context.findIndex((key) => strip(key) !== "");
+  const needleGaps = context.flatMap(gaps);
   const starts: number[] = [];
+  const textGaps: Gap[] = [];
   let text = "";
   for (const key of keys) {
     starts.push(text.length);
     text += strip(key);
+    textGaps.push(...gaps(key));
   }
+  // Both sides must agree wherever both know whether whitespace precedes a character.
+  const spacedAlike = (at: number) =>
+    needleGaps.every((gap, i) => gap === GAP_UNKNOWN || textGaps[at + i] === GAP_UNKNOWN || textGaps[at + i] === gap);
   // The last row starting at or before `offset` holds that character; empty rows before it share its start.
   const rowAt = (offset: number) => {
     let lo = 0;
@@ -222,6 +250,7 @@ function rewrappedRow(context: readonly string[], keys: readonly string[], predi
   let best: number | null = null;
   let bestDistance = Number.POSITIVE_INFINITY;
   for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + 1)) {
+    if (!spacedAlike(at)) continue;
     const row = rowAt(at) - blankLead;
     const distance = Math.min(...predictions.map((p) => Math.abs(p - row)));
     if (distance < bestDistance) {
