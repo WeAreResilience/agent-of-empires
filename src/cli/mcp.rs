@@ -3,6 +3,9 @@
 use anyhow::{bail, Result};
 use clap::{Subcommand, ValueEnum};
 
+use super::serve::ServeUrl;
+use crate::server::ip_discovery::IpKind;
+
 use crate::session::mcp::mcp_model::{resolve_surface, McpSurfaceView};
 use crate::session::mcp::mcp_overrides::{
     self, classify_missing, McpServerInput, McpWriteError, SecretEntry,
@@ -20,6 +23,9 @@ pub enum McpCommands {
     Edit(McpEditArgs),
     /// Remove an AoE-owned MCP server.
     Remove(McpRemoveArgs),
+    /// Print an MCP client config for the running daemon's `/mcp` server, ready to paste into
+    /// an agent's `mcpServers` (for example a Claude Code `.mcp.json`).
+    Config,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -126,6 +132,7 @@ pub async fn run(profile: &str, command: McpCommands) -> Result<()> {
         McpCommands::Add(args) => add(profile, args),
         McpCommands::Edit(args) => edit(profile, args),
         McpCommands::Remove(args) => remove(profile, args),
+        McpCommands::Config => config(profile),
     }
 }
 
@@ -402,6 +409,52 @@ fn transport_detail(r: &crate::session::mcp::mcp_model::RedactedMcpServer) -> St
     s
 }
 
+/// Server name used in the printed `mcpServers` entry.
+const CLIENT_ENTRY_NAME: &str = "aoe";
+
+fn config(profile: &str) -> Result<()> {
+    if super::serve::daemon_pid().is_none() {
+        bail!(
+            "No aoe serve daemon is running, so there is no /mcp server to connect to.\n\
+             Start one with: aoe serve --daemon"
+        );
+    }
+    let entry = client_config(&super::serve::read_serve_urls())?;
+    if !crate::session::config::profile_config::resolve_config_or_warn(profile)
+        .web
+        .mcp_enabled
+    {
+        eprintln!(
+            "warning: web.mcp_enabled is off, so the daemon does not serve /mcp.\n\
+             Turn it on in Settings or set `[web] mcp_enabled = true` in config.toml, \
+             then run: aoe serve --restart"
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&entry)?);
+    Ok(())
+}
+
+/// The `mcpServers` object for the daemon advertised in `serve.url`. Prefers the loopback URL,
+/// which a remote daemon lists second, because outside agents run on the daemon's host.
+fn client_config(urls: &[ServeUrl]) -> Result<serde_json::Value> {
+    let Some(chosen) = urls
+        .iter()
+        .find(|u| u.label.as_deref() == Some(IpKind::Loopback.label()))
+        .or_else(|| urls.first())
+    else {
+        bail!("Daemon is running but the URL file is empty or missing.");
+    };
+    let base = reqwest::Url::parse(&chosen.url)
+        .map_err(|e| anyhow::anyhow!("Daemon URL {:?} is not a valid URL: {e}", chosen.url))?;
+    let token = super::url::extract_token(&chosen.url);
+    let mcp_url = base.join("/mcp")?;
+    let mut server = serde_json::json!({ "type": "http", "url": mcp_url.as_str() });
+    if let Some(token) = token {
+        server["headers"] = serde_json::json!({ "Authorization": format!("Bearer {token}") });
+    }
+    Ok(serde_json::json!({ "mcpServers": { CLIENT_ENTRY_NAME: server } }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +521,75 @@ mod tests {
             },
         };
         assert!(edit_input(&remote, &edit_args(&["--clear-args"])).is_err());
+    }
+
+    fn serve_urls(lines: &[(Option<&str>, &str)]) -> Vec<ServeUrl> {
+        lines
+            .iter()
+            .map(|(label, url)| ServeUrl {
+                label: label.map(Into::into),
+                url: (*url).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn client_config_targets_loopback_mcp_with_the_daemon_token() {
+        let bearer = |url: &str, token: &str| {
+            serde_json::json!({ "mcpServers": { "aoe": {
+                "type": "http",
+                "url": url,
+                "headers": { "Authorization": format!("Bearer {token}") },
+            } } })
+        };
+        for (what, urls, expected) in [
+            (
+                "localhost-only daemon",
+                serve_urls(&[(None, "http://localhost:8080/?token=abc")]),
+                bearer("http://localhost:8080/mcp", "abc"),
+            ),
+            (
+                "0.0.0.0 daemon lists LAN first and localhost last",
+                serve_urls(&[
+                    (None, "http://192.168.1.5:8080/?token=abc"),
+                    (Some("lan"), "http://10.0.0.2:8080/?token=abc"),
+                    (Some("localhost"), "http://localhost:8080/?token=abc"),
+                ]),
+                bearer("http://localhost:8080/mcp", "abc"),
+            ),
+            (
+                "remote daemon lists the public URL first",
+                serve_urls(&[
+                    (None, "https://aoe.example.test/?token=rot"),
+                    (Some("localhost"), "http://127.0.0.1:8080/?token=rot"),
+                ]),
+                bearer("http://127.0.0.1:8080/mcp", "rot"),
+            ),
+            (
+                "daemon without a token gate",
+                serve_urls(&[(None, "http://localhost:8080/")]),
+                serde_json::json!({ "mcpServers": { "aoe": {
+                    "type": "http",
+                    "url": "http://localhost:8080/mcp",
+                } } }),
+            ),
+            (
+                "other query parameters are dropped with the token",
+                serve_urls(&[(None, "http://localhost:8080/?foo=bar&token=zzz")]),
+                bearer("http://localhost:8080/mcp", "zzz"),
+            ),
+        ] {
+            assert_eq!(client_config(&urls).unwrap(), expected, "{what}");
+        }
+    }
+
+    #[test]
+    fn client_config_rejects_a_missing_or_malformed_url_file() {
+        for (what, urls) in [
+            ("empty url file", serve_urls(&[])),
+            ("unparseable url", serve_urls(&[(None, "not a url")])),
+        ] {
+            assert!(client_config(&urls).is_err(), "{what}");
+        }
     }
 }

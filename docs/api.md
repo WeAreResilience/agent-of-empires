@@ -42,6 +42,7 @@ Daemon to enable Streamable HTTP at `/mcp`. The route is absent by default.
 It shares the existing API router and does not expose TCP or web assets when
 running core-only. TCP uses the API's token and login policy; the private
 `daemon/api.sock` accepts the authenticated same-UID owner peer without a token.
+To connect an agent, see [Controlling AoE over MCP](guides/mcp-control.md).
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
