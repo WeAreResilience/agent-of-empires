@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 use clap::{Subcommand, ValueEnum};
 
-use super::serve::ServeUrl;
+use super::serve::{AuthMode, DaemonStatus, ServeLaunch, ServeUrl};
 use crate::server::ip_discovery::IpKind;
 
 use crate::session::mcp::mcp_model::{resolve_surface, McpSurfaceView};
@@ -132,7 +132,7 @@ pub async fn run(profile: &str, command: McpCommands) -> Result<()> {
         McpCommands::Add(args) => add(profile, args),
         McpCommands::Edit(args) => edit(profile, args),
         McpCommands::Remove(args) => remove(profile, args),
-        McpCommands::Config => config(profile),
+        McpCommands::Config => config(profile).await,
     }
 }
 
@@ -412,31 +412,64 @@ fn transport_detail(r: &crate::session::mcp::mcp_model::RedactedMcpServer) -> St
 /// Server name used in the printed `mcpServers` entry.
 const CLIENT_ENTRY_NAME: &str = "aoe";
 
-fn config(profile: &str) -> Result<()> {
-    if super::serve::daemon_pid().is_none() {
-        bail!(
+/// How long `aoe mcp config` waits for the daemon to answer its `/mcp` probe.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn config(profile: &str) -> Result<()> {
+    let pid = match super::serve::daemon_status() {
+        DaemonStatus::Verified(pid) => pid,
+        DaemonStatus::Absent => bail!(
             "No aoe serve daemon is running, so there is no /mcp server to connect to.\n\
              Start one with: aoe serve --daemon"
-        );
+        ),
+        DaemonStatus::Unverified => bail!(
+            "Could not confirm that the aoe serve daemon is running: its pid file is unreadable \
+             or the process check failed.\n\
+             Check it with: aoe serve --status"
+        ),
+    };
+    if let Some(launch) = super::serve::running_launch(pid) {
+        if let Some(reason) = unsupported_auth(&launch) {
+            bail!("{reason}");
+        }
     }
-    let entry = client_config(&super::serve::read_serve_urls())?;
-    if !crate::session::config::profile_config::resolve_config_or_warn(profile)
+    let entry = client_entry(&super::serve::read_serve_urls())?;
+    let configured = crate::session::config::profile_config::resolve_config_or_warn(profile)
         .web
-        .mcp_enabled
-    {
-        eprintln!(
-            "warning: web.mcp_enabled is off, so the daemon does not serve /mcp.\n\
-             Turn it on in Settings or set `[web] mcp_enabled = true` in config.toml, \
-             then run: aoe serve --restart"
-        );
+        .mcp_enabled;
+    match probe_mcp(&entry).await {
+        RouteProbe::Rejected(status) => bail!(rejected_message(&entry, status)),
+        probe => {
+            if let Some(notice) = route_notice(&probe, configured) {
+                eprintln!("{notice}");
+            }
+        }
     }
-    println!("{}", serde_json::to_string_pretty(&entry)?);
+    println!("{}", serde_json::to_string_pretty(&entry.to_json())?);
     Ok(())
 }
 
-/// The `mcpServers` object for the daemon advertised in `serve.url`. Prefers the loopback URL,
-/// which a remote daemon lists second, because outside agents run on the daemon's host.
-fn client_config(urls: &[ServeUrl]) -> Result<serde_json::Value> {
+/// The URL and credential an MCP client uses to reach the daemon's `/mcp` route.
+#[derive(Debug, PartialEq)]
+struct ClientEntry {
+    url: String,
+    token: Option<String>,
+}
+
+impl ClientEntry {
+    /// The `mcpServers` object printed for the client.
+    fn to_json(&self) -> serde_json::Value {
+        let mut server = serde_json::json!({ "type": "http", "url": self.url });
+        if let Some(token) = &self.token {
+            server["headers"] = serde_json::json!({ "Authorization": format!("Bearer {token}") });
+        }
+        serde_json::json!({ "mcpServers": { CLIENT_ENTRY_NAME: server } })
+    }
+}
+
+/// The entry for the daemon advertised in `serve.url`. Prefers the loopback URL, which a remote
+/// daemon lists second, because outside agents run on the daemon's host.
+fn client_entry(urls: &[ServeUrl]) -> Result<ClientEntry> {
     let Some(chosen) = urls
         .iter()
         .find(|u| u.label.as_deref() == Some(IpKind::Loopback.label()))
@@ -446,13 +479,125 @@ fn client_config(urls: &[ServeUrl]) -> Result<serde_json::Value> {
     };
     let base = reqwest::Url::parse(&chosen.url)
         .map_err(|e| anyhow::anyhow!("Daemon URL {:?} is not a valid URL: {e}", chosen.url))?;
-    let token = super::url::extract_token(&chosen.url);
-    let mcp_url = base.join("/mcp")?;
-    let mut server = serde_json::json!({ "type": "http", "url": mcp_url.as_str() });
-    if let Some(token) = token {
-        server["headers"] = serde_json::json!({ "Authorization": format!("Bearer {token}") });
+    // `join` with an absolute path drops the query, so the token never lands in the URL.
+    let url = base.join("/mcp")?.to_string();
+    let token = super::url::extract_token(&chosen.url).map(str::to_owned);
+    Ok(ClientEntry { url, token })
+}
+
+/// Why the running daemon's auth mode admits no entry this command can print. A tokenless
+/// passphrase daemon behind a proxy or tunnel extends its login wall to loopback callers, so
+/// `/mcp` needs a browser login session there and rejects a bearer token.
+fn unsupported_auth(launch: &ServeLaunch) -> Option<String> {
+    if !matches!(launch.auth_mode, AuthMode::Passphrase) || !(launch.behind_proxy || launch.remote)
+    {
+        return None;
     }
-    Ok(serde_json::json!({ "mcpServers": { CLIENT_ENTRY_NAME: server } }))
+    let flag = if launch.remote {
+        "--remote"
+    } else {
+        "--behind-proxy"
+    };
+    Some(format!(
+        "The running daemon uses --auth passphrase with {flag}, so its login wall also covers \
+         loopback: /mcp accepts only a browser login session and no bearer token.\n\
+         aoe mcp config cannot print a working entry for this mode. Restart the daemon with \
+         --auth token to give MCP clients a bearer token, or without {flag} if no proxy \
+         fronts it."
+    ))
+}
+
+/// What the running daemon said about `/mcp` when probed with the printed entry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RouteProbe {
+    /// The route exists and accepted the credential.
+    Served,
+    /// The daemon has no `/mcp` route: it started with `web.mcp_enabled` off.
+    Absent,
+    /// The daemon refused the credential the entry carries.
+    Rejected(reqwest::StatusCode),
+    /// The daemon could not be reached, so its route state is unknown.
+    Unreachable,
+}
+
+impl RouteProbe {
+    fn from_status(status: reqwest::StatusCode) -> Self {
+        use reqwest::StatusCode;
+        match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Self::Rejected(status),
+            // Without the route, a `web` build's GET-only dashboard fallback answers 405.
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => Self::Absent,
+            _ => Self::Served,
+        }
+    }
+}
+
+/// POST a JSON-RPC `ping` to `/mcp` with the entry's credential. The server is stateless, so
+/// the probe leaves nothing behind on the daemon.
+async fn probe_mcp(entry: &ClientEntry) -> RouteProbe {
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+    else {
+        return RouteProbe::Unreachable;
+    };
+    let mut req = client
+        .post(&entry.url)
+        .header("accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }));
+    if let Some(token) = &entry.token {
+        req = req.bearer_auth(token);
+    }
+    match req.send().await {
+        Ok(resp) => RouteProbe::from_status(resp.status()),
+        Err(_) => RouteProbe::Unreachable,
+    }
+}
+
+/// The stderr note for a probe result, given the `web.mcp_enabled` value in `config.toml`.
+/// The daemon reads that setting only at startup, so the two can disagree until a restart.
+fn route_notice(probe: &RouteProbe, configured: bool) -> Option<String> {
+    match (probe, configured) {
+        (RouteProbe::Served, true) | (RouteProbe::Rejected(_), _) => None,
+        (RouteProbe::Served, false) => Some(
+            "note: the running daemon serves /mcp, but config.toml now turns web.mcp_enabled \
+             off, so the route goes away at the next daemon restart."
+                .into(),
+        ),
+        (RouteProbe::Absent, true) => Some(
+            "warning: the running daemon does not serve /mcp. It started before \
+             web.mcp_enabled was turned on, and reads the setting only at startup.\n\
+             Apply it with: aoe serve --restart"
+                .into(),
+        ),
+        (RouteProbe::Absent, false) => Some(
+            "warning: the running daemon does not serve /mcp because web.mcp_enabled is off.\n\
+             Turn it on in Settings or set `[web] mcp_enabled = true` in config.toml, then \
+             run: aoe serve --restart"
+                .into(),
+        ),
+        (RouteProbe::Unreachable, configured) => Some(format!(
+            "warning: could not reach the daemon to confirm it serves /mcp. config.toml has \
+             web.mcp_enabled {}, which the daemon applies only at startup.",
+            if configured { "on" } else { "off" }
+        )),
+    }
+}
+
+/// The error for a daemon that refused the entry's credential on `/mcp`.
+fn rejected_message(entry: &ClientEntry, status: reqwest::StatusCode) -> String {
+    let cause = if entry.token.is_some() {
+        "the daemon token in serve.url was not accepted; it may have just rotated, so run \
+         aoe mcp config again"
+    } else {
+        "serve.url carries no token, and the daemon requires a credential this command cannot \
+         provide, such as a passphrase login session"
+    };
+    format!(
+        "The daemon answered /mcp with {status}: {cause}.\n\
+         Check its auth mode with: aoe serve --status"
+    )
 }
 
 #[cfg(test)]
@@ -534,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn client_config_targets_loopback_mcp_with_the_daemon_token() {
+    fn client_entry_targets_loopback_mcp_with_the_daemon_token() {
         let bearer = |url: &str, token: &str| {
             serde_json::json!({ "mcpServers": { "aoe": {
                 "type": "http",
@@ -579,17 +724,128 @@ mod tests {
                 bearer("http://localhost:8080/mcp", "zzz"),
             ),
         ] {
-            assert_eq!(client_config(&urls).unwrap(), expected, "{what}");
+            assert_eq!(client_entry(&urls).unwrap().to_json(), expected, "{what}");
         }
     }
 
     #[test]
-    fn client_config_rejects_a_missing_or_malformed_url_file() {
+    fn client_entry_rejects_a_missing_or_malformed_url_file() {
         for (what, urls) in [
             ("empty url file", serve_urls(&[])),
             ("unparseable url", serve_urls(&[(None, "not a url")])),
         ] {
-            assert!(client_config(&urls).is_err(), "{what}");
+            assert!(client_entry(&urls).is_err(), "{what}");
         }
+    }
+
+    fn launch(auth_mode: AuthMode, behind_proxy: bool, remote: bool) -> ServeLaunch {
+        ServeLaunch {
+            schema: super::super::serve::SERVE_LAUNCH_SCHEMA,
+            pid: 1,
+            instance_id: None,
+            profile: "default".into(),
+            core_only: false,
+            host: "127.0.0.1".into(),
+            port: 8080,
+            auth_mode,
+            has_passphrase: false,
+            behind_proxy,
+            read_only: false,
+            cityhall: false,
+            remote,
+            tunnel_name: None,
+            tunnel_url: None,
+            no_tailscale: false,
+            allowed_host: Vec::new(),
+            allowed_origin: Vec::new(),
+            additional_fields: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn only_a_passphrase_wall_over_loopback_is_unsupported() {
+        // (auth, behind_proxy, remote, unsupported): the passphrase wall skips loopback unless
+        // a proxy or tunnel fronts the daemon, and a valid token always passes on loopback.
+        for (auth, proxy, remote, unsupported) in [
+            (AuthMode::Passphrase, true, false, true),
+            (AuthMode::Passphrase, false, true, true),
+            (AuthMode::Passphrase, false, false, false),
+            (AuthMode::Token, true, false, false),
+            (AuthMode::Token, false, true, false),
+            (AuthMode::None, true, false, false),
+            (AuthMode::None, false, false, false),
+        ] {
+            let reason = unsupported_auth(&launch(auth, proxy, remote));
+            assert_eq!(
+                reason.is_some(),
+                unsupported,
+                "{auth:?} proxy={proxy} remote={remote}: {reason:?}"
+            );
+        }
+        let reason = unsupported_auth(&launch(AuthMode::Passphrase, true, false)).unwrap();
+        assert!(reason.contains("--behind-proxy"), "{reason}");
+        assert!(reason.contains("--auth token"), "{reason}");
+    }
+
+    #[test]
+    fn probe_status_classifies_the_live_route() {
+        use reqwest::StatusCode;
+        for (status, expected) in [
+            (StatusCode::OK, RouteProbe::Served),
+            (StatusCode::ACCEPTED, RouteProbe::Served),
+            (StatusCode::BAD_REQUEST, RouteProbe::Served),
+            (StatusCode::NOT_ACCEPTABLE, RouteProbe::Served),
+            (StatusCode::NOT_FOUND, RouteProbe::Absent),
+            (StatusCode::METHOD_NOT_ALLOWED, RouteProbe::Absent),
+            (
+                StatusCode::UNAUTHORIZED,
+                RouteProbe::Rejected(StatusCode::UNAUTHORIZED),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                RouteProbe::Rejected(StatusCode::FORBIDDEN),
+            ),
+        ] {
+            assert_eq!(RouteProbe::from_status(status), expected, "{status}");
+        }
+    }
+
+    #[test]
+    fn route_notice_follows_the_live_route_not_the_config_file() {
+        let notice = |probe, configured| route_notice(&probe, configured).unwrap_or_default();
+        assert_eq!(notice(RouteProbe::Served, true), "");
+        // Turned off since startup: the route still works until the next restart.
+        let off_since = notice(RouteProbe::Served, false);
+        assert!(off_since.contains("next daemon restart"), "{off_since}");
+        assert!(!off_since.contains("warning"), "{off_since}");
+        // Turned on since startup: the route is still missing.
+        let on_since = notice(RouteProbe::Absent, true);
+        assert!(on_since.contains("started before"), "{on_since}");
+        assert!(on_since.contains("aoe serve --restart"), "{on_since}");
+        let off = notice(RouteProbe::Absent, false);
+        assert!(off.contains("web.mcp_enabled is off"), "{off}");
+        assert!(off.contains("aoe serve --restart"), "{off}");
+        let unknown = notice(RouteProbe::Unreachable, true);
+        assert!(unknown.contains("could not reach"), "{unknown}");
+        assert!(unknown.contains("only at startup"), "{unknown}");
+    }
+
+    #[test]
+    fn rejected_message_names_the_missing_credential() {
+        let status = reqwest::StatusCode::UNAUTHORIZED;
+        let tokenless = ClientEntry {
+            url: "http://127.0.0.1:8080/mcp".into(),
+            token: None,
+        };
+        let msg = rejected_message(&tokenless, status);
+        assert!(msg.contains("no token"), "{msg}");
+        assert!(msg.contains("aoe serve --status"), "{msg}");
+        let with_token = ClientEntry {
+            token: Some("abc".into()),
+            ..tokenless
+        };
+        let msg = rejected_message(&with_token, status);
+        assert!(msg.contains("rotated"), "{msg}");
+        assert!(!msg.contains("abc"), "the token is never echoed: {msg}");
     }
 }

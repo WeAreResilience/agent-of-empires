@@ -4,7 +4,7 @@ use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use serial_test::parallel;
 
-use crate::harness::TuiTestHarness;
+use crate::harness::{app_dir_in, TuiTestHarness};
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Runtime::new()
@@ -52,10 +52,10 @@ fn cli_mcp_config_entry_connects_to_the_daemon() {
 
     let out = h.run_cli(&["mcp", "config"]);
     assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.stderr.is_empty(),
-        "no warning with the setting on: {}",
-        String::from_utf8_lossy(&out.stderr)
+        !stderr.contains("mcp_enabled"),
+        "no route warning with the setting on: {stderr}"
     );
     let printed: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     let entry = &printed["mcpServers"]["aoe"];
@@ -110,7 +110,7 @@ fn cli_mcp_config_guides_when_no_daemon_or_setting_is_off() {
     let out = h.run_cli(&["mcp", "config"]);
     assert!(out.status.success(), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("mcp_enabled"), "{stderr}");
+    assert!(stderr.contains("web.mcp_enabled is off"), "{stderr}");
     let printed: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     assert!(
         printed["mcpServers"]["aoe"].get("headers").is_none(),
@@ -128,4 +128,123 @@ fn cli_mcp_config_guides_when_no_daemon_or_setting_is_off() {
         ),
         "{status}"
     );
+}
+
+/// Rewrite `[web] mcp_enabled` in the harness config without touching the running daemon.
+fn set_mcp_enabled(h: &TuiTestHarness, enabled: bool) {
+    let path = app_dir_in(h.home_path()).join("config.toml");
+    let raw = std::fs::read_to_string(&path).expect("read config.toml");
+    let from = format!("mcp_enabled = {}", !enabled);
+    assert!(raw.contains(&from), "config has {from}: {raw}");
+    let to = format!("mcp_enabled = {enabled}");
+    std::fs::write(&path, raw.replace(&from, &to)).expect("write config.toml");
+}
+
+fn headers_of(entry: &Value) -> Vec<(String, String)> {
+    entry["headers"]
+        .as_object()
+        .map(|h| {
+            h.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().expect("header string").to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The daemon reads `web.mcp_enabled` only at startup, so the guidance follows the live route.
+#[test]
+#[parallel]
+fn cli_mcp_config_reports_the_live_route_after_the_setting_changes() {
+    // Turned on after startup: the route is still absent and a restart applies it.
+    let mut h = TuiTestHarness::new("mcp_config_enabled_since_start");
+    h.append_config("[web]\nmcp_enabled = false");
+    h.stop_daemon_on_drop();
+    h.start_daemon();
+    set_mcp_enabled(&h, true);
+    let out = h.run_cli(&["mcp", "config"]);
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not serve /mcp"), "{stderr}");
+    assert!(stderr.contains("started before"), "{stderr}");
+    assert!(stderr.contains("aoe serve --restart"), "{stderr}");
+
+    // Turned off after startup: the route still answers, and only the next restart drops it.
+    let mut h = TuiTestHarness::new("mcp_config_disabled_since_start");
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    h.start_daemon_with(&[]);
+    set_mcp_enabled(&h, false);
+    let out = h.run_cli(&["mcp", "config"]);
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("next daemon restart"), "{stderr}");
+    assert!(!stderr.contains("does not serve"), "{stderr}");
+    let printed: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let entry = &printed["mcpServers"]["aoe"];
+    let url = entry["url"].as_str().expect("url string");
+    let (status, body) = block_on(rpc(url, &headers_of(entry), initialize()));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the live route still serves: {body}"
+    );
+}
+
+/// A passphrase daemon without a proxy lets loopback callers through, so the headerless entry
+/// works as printed.
+#[test]
+#[parallel]
+fn cli_mcp_config_passphrase_daemon_on_loopback_needs_no_header() {
+    let mut h = TuiTestHarness::new("mcp_config_passphrase_loopback");
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    h.start_daemon_with(&["--auth", "passphrase", "--passphrase", "e2e-pass"]);
+    let out = h.run_cli(&["mcp", "config"]);
+    assert!(out.status.success(), "{out:?}");
+    let printed: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let entry = &printed["mcpServers"]["aoe"];
+    assert!(entry.get("headers").is_none(), "{printed}");
+    let url = entry["url"].as_str().expect("url string");
+    let (status, body) = block_on(rpc(url, &[], initialize()));
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Behind a proxy the passphrase wall covers loopback, so a headerless entry would get
+/// `401 login_required`. The command refuses with guidance and the wall stays in place.
+#[test]
+#[parallel]
+fn cli_mcp_config_refuses_a_passphrase_daemon_behind_a_proxy() {
+    let mut h = TuiTestHarness::new("mcp_config_passphrase_proxy");
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon_with(&[
+        "--auth",
+        "passphrase",
+        "--passphrase",
+        "e2e-pass",
+        "--behind-proxy",
+        "--allowed-host",
+        "aoe.example.test",
+    ]);
+    let out = h.run_cli(&["mcp", "config"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "no entry is printed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--behind-proxy"), "{stderr}");
+    assert!(stderr.contains("--auth token"), "{stderr}");
+
+    // The premise holds: a credential-less /mcp request from this host is walled off.
+    let resp = block_on(async {
+        Client::new()
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .header("host", "aoe.example.test")
+            .header("accept", "application/json, text/event-stream")
+            .json(&initialize())
+            .send()
+            .await
+            .expect("POST /mcp")
+    });
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = block_on(resp.json()).unwrap_or(Value::Null);
+    assert_eq!(body["error"], "login_required", "{body}");
 }
