@@ -40,9 +40,12 @@ with `403 read_only`. Read endpoints work normally.
 Set `[web] mcp_enabled = true` in global `config.toml`, then restart the
 Daemon to enable Streamable HTTP at `/mcp`. The route is absent by default.
 It shares the existing API router and does not expose TCP or web assets when
-running core-only. TCP uses the API's token and login policy; the private
-`daemon/api.sock` accepts the authenticated same-UID owner peer without a token.
-To connect an agent, see [Controlling AoE over MCP](guides/mcp-control.md).
+running core-only. TCP follows the same authentication mode as the rest of the
+API: with token or passphrase authentication on, a request without a valid
+credential gets `401`, and a daemon running `--auth none` needs none. The
+private `daemon/api.sock` accepts the authenticated same-UID owner peer without
+a token. To connect an agent, see
+[Controlling AoE over MCP](guides/mcp-control.md).
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
