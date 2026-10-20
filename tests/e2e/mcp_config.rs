@@ -234,17 +234,12 @@ fn cli_mcp_config_refuses_a_passphrase_daemon_behind_a_proxy() {
     assert!(stderr.contains("--auth token"), "{stderr}");
 
     // The premise holds: a credential-less /mcp request from this host is walled off.
-    let resp = block_on(async {
-        Client::new()
-            .post(format!("http://127.0.0.1:{port}/mcp"))
-            .header("host", "aoe.example.test")
-            .header("accept", "application/json, text/event-stream")
-            .json(&initialize())
-            .send()
-            .await
-            .expect("POST /mcp")
-    });
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let body: Value = block_on(resp.json()).unwrap_or(Value::Null);
+    // `rpc` reads the body inside the same runtime as the send.
+    let (status, body) = block_on(rpc(
+        &format!("http://127.0.0.1:{port}/mcp"),
+        &[("host".into(), "aoe.example.test".into())],
+        initialize(),
+    ));
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["error"], "login_required", "{body}");
 }
