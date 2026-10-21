@@ -39,7 +39,7 @@ It prints an `mcpServers` entry for the running daemon: the loopback `/mcp` URL 
 
 Paste it into the agent's MCP configuration, for example a Claude Code `.mcp.json` in your project. The output contains the daemon token, so keep it out of version control.
 
-Before printing, the command asks the running daemon whether it serves `/mcp`, because the daemon applies `mcp_enabled` only at startup. If you turned the setting on after the daemon started, it warns that `/mcp` is not served yet and that `aoe serve --restart` applies it; if you turned it off, it notes that the route goes away at the next restart. Without a running daemon it exits non-zero and tells you how to start one.
+Before printing, the command asks the running daemon whether it serves `/mcp`, because the daemon applies `mcp_enabled` only at startup. If you turned the setting on after the daemon started, it warns that `/mcp` is not served yet and that `aoe serve --restart` applies it; if you turned it off, it notes that the route goes away at the next restart. If the daemon is rate-limiting authentication from your address after repeated failed attempts (HTTP 429), it warns that it could not confirm the route; wait for the 15-minute lockout to end and run the command again. Without a running daemon it exits non-zero and tells you how to start one.
 
 ### Authentication modes
 

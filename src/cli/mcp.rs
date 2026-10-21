@@ -516,6 +516,9 @@ enum RouteProbe {
     Absent,
     /// The daemon refused the credential the entry carries.
     Rejected(reqwest::StatusCode),
+    /// The daemon's auth rate limiter answered 429 before checking the credential or routing
+    /// the request, so the reply says nothing about whether `/mcp` exists.
+    RateLimited,
     /// The daemon could not be reached, so its route state is unknown.
     Unreachable,
 }
@@ -525,6 +528,8 @@ impl RouteProbe {
         use reqwest::StatusCode;
         match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Self::Rejected(status),
+            // Auth middleware rate-limits before route dispatch, even for an absent route.
+            StatusCode::TOO_MANY_REQUESTS => Self::RateLimited,
             // Without the route, a `web` build's GET-only dashboard fallback answers 405.
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => Self::Absent,
             _ => Self::Served,
@@ -577,6 +582,13 @@ fn route_notice(probe: &RouteProbe, configured: bool) -> Option<String> {
              run: aoe serve --restart"
                 .into(),
         ),
+        (RouteProbe::RateLimited, configured) => Some(format!(
+            "warning: the daemon is rate-limiting authentication from this address after \
+             repeated failed attempts, so this command could not confirm it serves /mcp. \
+             config.toml has web.mcp_enabled {}, which the daemon applies only at startup.\n\
+             Wait for the lockout to clear (up to 15 minutes), then run aoe mcp config again.",
+            if configured { "on" } else { "off" }
+        )),
         (RouteProbe::Unreachable, configured) => Some(format!(
             "warning: could not reach the daemon to confirm it serves /mcp. config.toml has \
              web.mcp_enabled {}, which the daemon applies only at startup.",
@@ -805,6 +817,7 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 RouteProbe::Rejected(StatusCode::FORBIDDEN),
             ),
+            (StatusCode::TOO_MANY_REQUESTS, RouteProbe::RateLimited),
         ] {
             assert_eq!(RouteProbe::from_status(status), expected, "{status}");
         }
@@ -828,6 +841,26 @@ mod tests {
         let unknown = notice(RouteProbe::Unreachable, true);
         assert!(unknown.contains("could not reach"), "{unknown}");
         assert!(unknown.contains("only at startup"), "{unknown}");
+    }
+
+    #[test]
+    fn rate_limited_probe_is_not_route_evidence() {
+        // A 429 comes from the auth limiter before routing, so neither configured value may
+        // read as served or absent, and both must say to retry.
+        for configured in [true, false] {
+            let msg = route_notice(&RouteProbe::RateLimited, configured).unwrap_or_default();
+            assert!(msg.starts_with("warning:"), "{msg}");
+            assert!(msg.contains("could not confirm"), "{msg}");
+            assert!(msg.contains("run aoe mcp config again"), "{msg}");
+            assert!(!msg.contains("serves /mcp, but"), "{msg}");
+            assert!(!msg.contains("does not serve"), "{msg}");
+            let state = if configured {
+                "enabled on"
+            } else {
+                "enabled off"
+            };
+            assert!(msg.contains(state), "{msg}");
+        }
     }
 
     #[test]
