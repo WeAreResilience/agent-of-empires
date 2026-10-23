@@ -485,25 +485,35 @@ fn client_entry(urls: &[ServeUrl]) -> Result<ClientEntry> {
     Ok(ClientEntry { url, token })
 }
 
-/// Why the running daemon's auth mode admits no entry this command can print. A tokenless
-/// passphrase daemon behind a proxy or tunnel extends its login wall to loopback callers, so
-/// `/mcp` needs a browser login session there and rejects a bearer token.
+/// Why this daemon has no MCP client entry the command can print.
+///
+/// A passphrase wall covers every TCP caller, including loopback, and `/mcp`
+/// takes that login only as a browser session cookie. A core-only daemon has
+/// no TCP listener.
 fn unsupported_auth(launch: &ServeLaunch) -> Option<String> {
-    if !matches!(launch.auth_mode, AuthMode::Passphrase) || !(launch.behind_proxy || launch.remote)
-    {
+    if launch.core_only {
+        return Some(
+            "The running daemon is core-only and does not listen on TCP, so it has no /mcp URL.\n\
+             Start a dashboard daemon with: aoe serve --daemon"
+                .into(),
+        );
+    }
+    if !matches!(launch.auth_mode, AuthMode::Passphrase) && !launch.has_passphrase {
         return None;
     }
-    let flag = if launch.remote {
-        "--remote"
+    let mode = if matches!(launch.auth_mode, AuthMode::Passphrase) {
+        "--auth passphrase"
+    } else if launch.remote {
+        "--remote, which keeps a passphrase login session on top of its token"
     } else {
-        "--behind-proxy"
+        "a passphrase login session on top of its token"
     };
     Some(format!(
-        "The running daemon uses --auth passphrase with {flag}, so its login wall also covers \
-         loopback: /mcp accepts only a browser login session and no bearer token.\n\
+        "The running daemon uses {mode}. /mcp accepts that login only as an aoe_session \
+         cookie, not a bearer token, and the wall covers loopback callers too.\n\
          aoe mcp config cannot print a working entry for this mode. Restart the daemon with \
-         --auth token to give MCP clients a bearer token, or without {flag} if no proxy \
-         fronts it."
+         --auth token and without --passphrase to give MCP clients a bearer token. A remote \
+         daemon cannot drop its passphrase."
     ))
 }
 
@@ -750,7 +760,12 @@ mod tests {
         }
     }
 
-    fn launch(auth_mode: AuthMode, behind_proxy: bool, remote: bool) -> ServeLaunch {
+    fn launch(
+        auth_mode: AuthMode,
+        behind_proxy: bool,
+        remote: bool,
+        has_passphrase: bool,
+    ) -> ServeLaunch {
         ServeLaunch {
             schema: super::super::serve::SERVE_LAUNCH_SCHEMA,
             pid: 1,
@@ -760,7 +775,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 8080,
             auth_mode,
-            has_passphrase: false,
+            has_passphrase,
             behind_proxy,
             read_only: false,
             cityhall: false,
@@ -775,28 +790,33 @@ mod tests {
     }
 
     #[test]
-    fn only_a_passphrase_wall_over_loopback_is_unsupported() {
-        // (auth, behind_proxy, remote, unsupported): the passphrase wall skips loopback unless
-        // a proxy or tunnel fronts the daemon, and a valid token always passes on loopback.
-        for (auth, proxy, remote, unsupported) in [
-            (AuthMode::Passphrase, true, false, true),
-            (AuthMode::Passphrase, false, true, true),
-            (AuthMode::Passphrase, false, false, false),
-            (AuthMode::Token, true, false, false),
-            (AuthMode::Token, false, true, false),
-            (AuthMode::None, true, false, false),
-            (AuthMode::None, false, false, false),
+    fn passphrase_wall_and_core_only_have_no_printable_entry() {
+        // (auth, behind_proxy, remote, has_passphrase, unsupported). The passphrase wall covers
+        // loopback, and a token daemon with a passphrase still requires the login cookie.
+        for (auth, proxy, remote, has_passphrase, unsupported) in [
+            (AuthMode::Passphrase, true, false, true, true),
+            (AuthMode::Passphrase, false, false, true, true),
+            (AuthMode::Token, true, false, false, false),
+            (AuthMode::Token, false, true, true, true),
+            (AuthMode::Token, false, true, false, false),
+            (AuthMode::None, true, false, false, false),
+            (AuthMode::None, false, false, false, false),
         ] {
-            let reason = unsupported_auth(&launch(auth, proxy, remote));
+            let reason = unsupported_auth(&launch(auth, proxy, remote, has_passphrase));
             assert_eq!(
                 reason.is_some(),
                 unsupported,
-                "{auth:?} proxy={proxy} remote={remote}: {reason:?}"
+                "{auth:?} proxy={proxy} remote={remote} passphrase={has_passphrase}: {reason:?}"
             );
         }
-        let reason = unsupported_auth(&launch(AuthMode::Passphrase, true, false)).unwrap();
-        assert!(reason.contains("--behind-proxy"), "{reason}");
+        let reason = unsupported_auth(&launch(AuthMode::Passphrase, false, false, true)).unwrap();
+        assert!(reason.contains("loopback"), "{reason}");
         assert!(reason.contains("--auth token"), "{reason}");
+
+        let mut core = launch(AuthMode::None, false, false, false);
+        core.core_only = true;
+        let reason = unsupported_auth(&core).unwrap();
+        assert!(reason.contains("core-only"), "{reason}");
     }
 
     #[test]

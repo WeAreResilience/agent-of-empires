@@ -45,12 +45,12 @@ sent as an `Authorization: Bearer` header (the form `aoe mcp config`
 generates), an `aoe_token` cookie, or a `?token=` query parameter, and returns
 `401` when it is missing or invalid. With passphrase authentication, a request
 needs a valid `aoe_session` login cookie, accepts no bearer token, and gets
-`401 login_required` without one; a loopback caller bypasses the wall unless
-the daemon runs `--behind-proxy`, where the wall covers loopback too. A
-token-authenticated daemon with a passphrase, such as `--remote`, still lets a
-loopback caller with a valid bearer token through. A daemon running `--auth
-none` needs no credential. The private `daemon/api.sock` accepts the
-authenticated same-UID owner peer without a token. To connect an agent, see
+`401 login_required` without one. The login wall covers loopback callers as
+well as remote ones. A token-authenticated daemon that also has a passphrase,
+such as `--remote`, still requires that login session on `/mcp`, so a bearer
+token alone is not enough. A daemon running `--auth none` needs no credential.
+The private `daemon/api.sock` accepts the authenticated same-UID owner peer
+without a token. To connect an agent, see
 [Controlling AoE over MCP](guides/mcp-control.md).
 
 | Tool | Arguments | Returns |

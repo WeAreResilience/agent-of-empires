@@ -45,10 +45,11 @@ Before printing, the command asks the running daemon whether it serves `/mcp`, b
 
 | Daemon | Entry |
 | --- | --- |
-| Token authentication (the default, including `--remote`) | URL plus the `Authorization: Bearer` header |
-| `--auth passphrase` without `--behind-proxy` | URL only; loopback callers bypass the login wall |
-| `--auth passphrase --behind-proxy` | None: the login wall covers loopback, and `/mcp` accepts only a browser login session. The command exits non-zero; restart the daemon with `--auth token`, or without `--behind-proxy` if no proxy fronts it |
+| Token authentication, no passphrase (the default) | URL plus the `Authorization: Bearer` header |
+| `--auth passphrase`, with or without `--behind-proxy` | None: the login wall covers every TCP caller, including loopback, and `/mcp` accepts only a browser login session. The command exits non-zero. Restart with `--auth token` and without `--passphrase` |
+| Token authentication plus a passphrase, including `--remote` | None: `/mcp` still requires the login session cookie, so a bearer token is not enough. The command exits non-zero. `--remote` cannot drop its passphrase |
 | `--auth none` | URL only |
+| `aoe serve --core-only` | None: a core-only daemon does not listen on TCP |
 
 If the daemon refuses the printed credential, for example because the token rotated at that moment, the command exits non-zero instead of printing an entry that cannot connect.
 
@@ -60,5 +61,6 @@ The tools and their arguments are listed in the [HTTP API reference](../api.md#m
 
 - The daemon must already be running. Connecting an MCP client does not start it.
 - `aoe mcp config` targets the daemon on this machine through its loopback address. It does not read `--daemon-url` or `AOE_DAEMON_URL`.
-- Under `aoe serve --remote` the token rotates every 4 hours, and a pasted entry stops working after the rotation grace period. Run `aoe mcp config` again to get the current token.
+- A passphrase login wall, including `--auth passphrase` and `aoe serve --remote`, covers loopback. `/mcp` accepts that login only as a browser session cookie, so the command exits non-zero instead of printing an entry.
+- A pasted token entry stops working after the daemon rotates its token. Run `aoe mcp config` again to get the current one.
 - An MCP client has the same access as you at the keyboard. AoE adds no per-tool permissions; the agent's own tool rules decide what it may call.

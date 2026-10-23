@@ -190,27 +190,33 @@ fn cli_mcp_config_reports_the_live_route_after_the_setting_changes() {
     );
 }
 
-/// A passphrase daemon without a proxy lets loopback callers through, so the headerless entry
-/// works as printed.
+/// The passphrase wall covers loopback, so a headerless entry would get
+/// `401 login_required`. The command refuses with guidance and the wall stays in place.
 #[test]
 #[parallel]
-fn cli_mcp_config_passphrase_daemon_on_loopback_needs_no_header() {
+fn cli_mcp_config_refuses_a_passphrase_daemon_on_loopback() {
     let mut h = TuiTestHarness::new("mcp_config_passphrase_loopback");
     h.append_config("[web]\nmcp_enabled = true");
     h.stop_daemon_on_drop();
-    h.start_daemon_with(&["--auth", "passphrase", "--passphrase", "e2e-pass"]);
+    let port = h.start_daemon_with(&["--auth", "passphrase", "--passphrase", "e2e-pass"]);
     let out = h.run_cli(&["mcp", "config"]);
-    assert!(out.status.success(), "{out:?}");
-    let printed: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
-    let entry = &printed["mcpServers"]["aoe"];
-    assert!(entry.get("headers").is_none(), "{printed}");
-    let url = entry["url"].as_str().expect("url string");
-    let (status, body) = block_on(rpc(url, &[], initialize()));
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "no entry is printed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("loopback"), "{stderr}");
+    assert!(stderr.contains("--auth token"), "{stderr}");
+
+    let (status, body) = block_on(rpc(
+        &format!("http://127.0.0.1:{port}/mcp"),
+        &[],
+        initialize(),
+    ));
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "login_required", "{body}");
 }
 
-/// Behind a proxy the passphrase wall covers loopback, so a headerless entry would get
-/// `401 login_required`. The command refuses with guidance and the wall stays in place.
+/// Behind a proxy the same wall still covers loopback. The command refuses and a
+/// credential-less request is `401 login_required`.
 #[test]
 #[parallel]
 fn cli_mcp_config_refuses_a_passphrase_daemon_behind_a_proxy() {
@@ -230,7 +236,7 @@ fn cli_mcp_config_refuses_a_passphrase_daemon_behind_a_proxy() {
     assert!(!out.status.success(), "{out:?}");
     assert!(out.stdout.is_empty(), "no entry is printed: {out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--behind-proxy"), "{stderr}");
+    assert!(stderr.contains("loopback"), "{stderr}");
     assert!(stderr.contains("--auth token"), "{stderr}");
 
     // The premise holds: a credential-less /mcp request from this host is walled off.
