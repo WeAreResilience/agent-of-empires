@@ -785,6 +785,7 @@ mod tests {
             auth_mode,
             has_passphrase,
             behind_proxy,
+            allow_plaintext_remote: false,
             read_only: false,
             cityhall: false,
             remote,
