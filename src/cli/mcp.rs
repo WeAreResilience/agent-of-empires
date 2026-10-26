@@ -478,7 +478,7 @@ fn client_entry(urls: &[ServeUrl]) -> Result<ClientEntry> {
         bail!("Daemon is running but the URL file is empty or missing.");
     };
     let base = reqwest::Url::parse(&chosen.url)
-        .map_err(|e| anyhow::anyhow!("Daemon URL {:?} is not a valid URL: {e}", chosen.url))?;
+        .map_err(|e| anyhow::anyhow!("Daemon URL is not valid: {e}"))?;
     // `join` with an absolute path drops the query, so the token never lands in the URL.
     let url = base.join("/mcp")?.to_string();
     let token = super::url::extract_token(&chosen.url).map(str::to_owned);
@@ -529,8 +529,8 @@ enum RouteProbe {
     /// The daemon's auth rate limiter answered 429 before checking the credential or routing
     /// the request, so the reply says nothing about whether `/mcp` exists.
     RateLimited,
-    /// The daemon could not be reached, so its route state is unknown.
-    Unreachable,
+    /// The probe could not confirm the route, including transport errors, redirects and 5xx.
+    Unverified,
 }
 
 impl RouteProbe {
@@ -542,6 +542,7 @@ impl RouteProbe {
             StatusCode::TOO_MANY_REQUESTS => Self::RateLimited,
             // Without the route, a `web` build's GET-only dashboard fallback answers 405.
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => Self::Absent,
+            _ if status.is_server_error() || status.is_redirection() => Self::Unverified,
             _ => Self::Served,
         }
     }
@@ -552,10 +553,11 @@ impl RouteProbe {
 async fn probe_mcp(entry: &ClientEntry) -> RouteProbe {
     let Ok(client) = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(PROBE_TIMEOUT)
         .build()
     else {
-        return RouteProbe::Unreachable;
+        return RouteProbe::Unverified;
     };
     let mut req = client
         .post(&entry.url)
@@ -566,7 +568,7 @@ async fn probe_mcp(entry: &ClientEntry) -> RouteProbe {
     }
     match req.send().await {
         Ok(resp) => RouteProbe::from_status(resp.status()),
-        Err(_) => RouteProbe::Unreachable,
+        Err(_) => RouteProbe::Unverified,
     }
 }
 
@@ -599,8 +601,8 @@ fn route_notice(probe: &RouteProbe, configured: bool) -> Option<String> {
              Wait for the lockout to clear (up to 15 minutes), then run aoe mcp config again.",
             if configured { "on" } else { "off" }
         )),
-        (RouteProbe::Unreachable, configured) => Some(format!(
-            "warning: could not reach the daemon to confirm it serves /mcp. config.toml has \
+        (RouteProbe::Unverified, configured) => Some(format!(
+            "warning: could not confirm that the daemon serves /mcp. config.toml has \
              web.mcp_enabled {}, which the daemon applies only at startup.",
             if configured { "on" } else { "off" }
         )),
@@ -610,8 +612,9 @@ fn route_notice(probe: &RouteProbe, configured: bool) -> Option<String> {
 /// The error for a daemon that refused the entry's credential on `/mcp`.
 fn rejected_message(entry: &ClientEntry, status: reqwest::StatusCode) -> String {
     let cause = if entry.token.is_some() {
-        "the daemon token in serve.url was not accepted; it may have just rotated, so run \
-         aoe mcp config again"
+        "the daemon token in serve.url was not accepted; it may have just rotated, or the \
+         daemon may require a passphrase login session. Run aoe mcp config again after \
+         checking its auth mode"
     } else {
         "serve.url carries no token, and the daemon requires a credential this command cannot \
          provide, such as a passphrase login session"
@@ -755,8 +758,13 @@ mod tests {
         for (what, urls) in [
             ("empty url file", serve_urls(&[])),
             ("unparseable url", serve_urls(&[(None, "not a url")])),
+            (
+                "malformed url carrying a token",
+                serve_urls(&[(None, "http://[invalid]/?token=private-token")]),
+            ),
         ] {
-            assert!(client_entry(&urls).is_err(), "{what}");
+            let error = client_entry(&urls).unwrap_err().to_string();
+            assert!(!error.contains("private-token"), "{what}: {error}");
         }
     }
 
@@ -838,9 +846,51 @@ mod tests {
                 RouteProbe::Rejected(StatusCode::FORBIDDEN),
             ),
             (StatusCode::TOO_MANY_REQUESTS, RouteProbe::RateLimited),
+            (StatusCode::INTERNAL_SERVER_ERROR, RouteProbe::Unverified),
+            (StatusCode::SERVICE_UNAVAILABLE, RouteProbe::Unverified),
+            (StatusCode::TEMPORARY_REDIRECT, RouteProbe::Unverified),
         ] {
             assert_eq!(RouteProbe::from_status(status), expected, "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn probe_does_not_follow_a_redirect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let requests = received.clone();
+        let redirected = Arc::new(AtomicUsize::new(0));
+        let observed = redirected.clone();
+        let app = axum::Router::new()
+            .route(
+                "/mcp",
+                axum::routing::post(move || async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    axum::response::Redirect::temporary("/target")
+                }),
+            )
+            .route(
+                "/target",
+                axum::routing::post(move || async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    reqwest::StatusCode::OK
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let entry = ClientEntry {
+            url: format!("http://{address}/mcp"),
+            token: Some("private-token".into()),
+        };
+        let result = probe_mcp(&entry).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+        assert_eq!(result, RouteProbe::Unverified);
+        assert_eq!(redirected.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -858,8 +908,8 @@ mod tests {
         let off = notice(RouteProbe::Absent, false);
         assert!(off.contains("web.mcp_enabled is off"), "{off}");
         assert!(off.contains("aoe serve --restart"), "{off}");
-        let unknown = notice(RouteProbe::Unreachable, true);
-        assert!(unknown.contains("could not reach"), "{unknown}");
+        let unknown = notice(RouteProbe::Unverified, true);
+        assert!(unknown.contains("could not confirm"), "{unknown}");
         assert!(unknown.contains("only at startup"), "{unknown}");
     }
 
@@ -899,6 +949,7 @@ mod tests {
         };
         let msg = rejected_message(&with_token, status);
         assert!(msg.contains("rotated"), "{msg}");
+        assert!(msg.contains("passphrase login session"), "{msg}");
         assert!(!msg.contains("abc"), "the token is never echoed: {msg}");
     }
 }
