@@ -439,6 +439,7 @@ async fn config(profile: &str) -> Result<()> {
         .mcp_enabled;
     match probe_mcp(&entry).await {
         RouteProbe::Rejected(status) => bail!(rejected_message(&entry, status)),
+        RouteProbe::PlaintextRefused => bail!(plaintext_refused_message(&entry)),
         probe => {
             if let Some(notice) = route_notice(&probe, configured) {
                 eprintln!("{notice}");
@@ -526,6 +527,9 @@ enum RouteProbe {
     Absent,
     /// The daemon refused the credential the entry carries.
     Rejected(reqwest::StatusCode),
+    /// The daemon answered 426: plain HTTP from a non-loopback peer, refused before auth
+    /// because the daemon runs without `--dangerously-allow-plaintext-remote`.
+    PlaintextRefused,
     /// The daemon's auth rate limiter answered 429 before checking the credential or routing
     /// the request, so the reply says nothing about whether `/mcp` exists.
     RateLimited,
@@ -538,6 +542,8 @@ impl RouteProbe {
         use reqwest::StatusCode;
         match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Self::Rejected(status),
+            // The plaintext gate runs before auth and routing, so every request gets the same.
+            StatusCode::UPGRADE_REQUIRED => Self::PlaintextRefused,
             // Auth middleware rate-limits before route dispatch, even for an absent route.
             StatusCode::TOO_MANY_REQUESTS => Self::RateLimited,
             // Without the route, a `web` build's GET-only dashboard fallback answers 405.
@@ -576,7 +582,9 @@ async fn probe_mcp(entry: &ClientEntry) -> RouteProbe {
 /// The daemon reads that setting only at startup, so the two can disagree until a restart.
 fn route_notice(probe: &RouteProbe, configured: bool) -> Option<String> {
     match (probe, configured) {
-        (RouteProbe::Served, true) | (RouteProbe::Rejected(_), _) => None,
+        (RouteProbe::Served, true)
+        | (RouteProbe::Rejected(_), _)
+        | (RouteProbe::PlaintextRefused, _) => None,
         (RouteProbe::Served, false) => Some(
             "note: the running daemon serves /mcp, but config.toml now turns web.mcp_enabled \
              off, so the route goes away at the next daemon restart."
@@ -607,6 +615,17 @@ fn route_notice(probe: &RouteProbe, configured: bool) -> Option<String> {
             if configured { "on" } else { "off" }
         )),
     }
+}
+
+/// The error for a daemon that refused the entry's plain HTTP URL with 426.
+fn plaintext_refused_message(entry: &ClientEntry) -> String {
+    format!(
+        "The daemon answered {} with 426 tls_required: it refuses plain HTTP from a \
+         non-loopback address, and serve.url lists no loopback URL for this command to use.\n\
+         Restart the daemon on a loopback bind, or add --dangerously-allow-plaintext-remote \
+         to its LAN or Tailscale bind.",
+        entry.url
+    )
 }
 
 /// The error for a daemon that refused the entry's credential on `/mcp`.
@@ -847,6 +866,7 @@ mod tests {
                 RouteProbe::Rejected(StatusCode::FORBIDDEN),
             ),
             (StatusCode::TOO_MANY_REQUESTS, RouteProbe::RateLimited),
+            (StatusCode::UPGRADE_REQUIRED, RouteProbe::PlaintextRefused),
             (StatusCode::INTERNAL_SERVER_ERROR, RouteProbe::Unverified),
             (StatusCode::SERVICE_UNAVAILABLE, RouteProbe::Unverified),
             (StatusCode::TEMPORARY_REDIRECT, RouteProbe::Unverified),
@@ -932,6 +952,22 @@ mod tests {
             };
             assert!(msg.contains(state), "{msg}");
         }
+    }
+
+    #[test]
+    fn plaintext_refused_message_names_the_opt_out_without_the_token() {
+        let entry = client_entry(&serve_urls(&[(
+            None,
+            "http://192.168.1.5:8080/?token=sekrit",
+        )]))
+        .unwrap();
+        let msg = plaintext_refused_message(&entry);
+        assert!(msg.contains("http://192.168.1.5:8080/mcp"), "{msg}");
+        assert!(
+            msg.contains("--dangerously-allow-plaintext-remote"),
+            "{msg}"
+        );
+        assert!(!msg.contains("sekrit"), "{msg}");
     }
 
     #[test]

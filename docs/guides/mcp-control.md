@@ -60,7 +60,7 @@ The tools and their arguments are listed in the [HTTP API reference](../api.md#m
 ## Known limits
 
 - The daemon must already be running. Connecting an MCP client does not start it.
-- `aoe mcp config` targets the daemon on this machine, preferring its loopback address when available; a daemon bound only to a LAN or Tailscale address uses that address. It does not read `--daemon-url` or `AOE_DAEMON_URL`.
+- `aoe mcp config` targets the daemon on this machine, preferring its loopback address when available; a daemon bound only to a LAN or Tailscale address uses that address, which works only if the daemon started with `--dangerously-allow-plaintext-remote`. Without it the daemon answers plain HTTP from that address with `426`, and the command exits non-zero instead of printing an entry. It does not read `--daemon-url` or `AOE_DAEMON_URL`.
 - A passphrase login wall, including `--auth passphrase` and `aoe serve --remote`, covers loopback. `/mcp` accepts that login only as a browser session cookie, so the command exits non-zero instead of printing an entry.
 - A pasted token entry stops working after the daemon rotates its token. Run `aoe mcp config` again to get the current one.
 - An MCP client has the same access as you at the keyboard. AoE adds no per-tool permissions; the agent's own tool rules decide what it may call.
